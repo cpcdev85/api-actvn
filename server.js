@@ -3,6 +3,10 @@ const puppeteer = require('puppeteer');
 const app = express();
 
 app.use(express.json());
+// THÊM ĐOẠN NÀY ĐỂ NHẬN BÁO THỨC
+app.get('/', (req, res) => {
+    res.status(200).send('Máy chủ đang thức!');
+});
 
 app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
