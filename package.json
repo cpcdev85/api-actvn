@@ -2,7 +2,7 @@
   "name": "api-actvn",
   "version": "1.0.0",
   "dependencies": {
-    "@sparticuz/chromium": "^123.0.1",
-    "puppeteer-core": "^22.6.0"
+    "@sparticuz/chromium": "^131.0.1",
+    "puppeteer-core": "^23.4.0"
   }
 }
