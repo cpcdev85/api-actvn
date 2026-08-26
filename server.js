@@ -29,7 +29,6 @@ app.post('/api/login', async (req, res) => {
         console.log("Truy cập trang chủ trường...");
         await page.goto('https://ktdbcl.actvn.edu.vn/dang-nhap.html', { waitUntil: 'domcontentloaded' });
 
-        // TỐI ƯU: Đọc link trực tiếp từ HTML thay vì click
         console.log("Đang bóc tách link đăng nhập Microsoft...");
         const msAuthUrl = await page.evaluate(() => {
             const btn = document.querySelector('button[data-socialurl*="login.microsoftonline.com"]');
@@ -37,8 +36,6 @@ app.post('/api/login', async (req, res) => {
         });
 
         if (msAuthUrl) {
-            console.log("Đã tìm thấy link SSO! Đang chuyển hướng trực tiếp sang Microsoft...");
-            // Giải mã các ký tự HTML entities (&amp; -> &) để link chuẩn xác
             const cleanUrl = msAuthUrl.replace(/&amp;/g, '&');
             await page.goto(cleanUrl, { waitUntil: 'domcontentloaded' });
         } else {
@@ -62,10 +59,33 @@ app.post('/api/login', async (req, res) => {
             await page.click('input[id="idSIButton9"]');
         } catch (e) { }
 
-        console.log("Chờ đăng nhập hoàn tất và lấy HTML...");
+        console.log("Chờ đăng nhập hoàn tất...");
         await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 });
-        const html = await page.content();
-        res.status(200).send(html);
+
+        // --- PHẦN MỚI: XỬ LÝ LẤY ĐIỂM ---
+        
+        console.log("Đang chuyển hướng sang trang xem điểm...");
+        await page.goto('https://ktdbcl.actvn.edu.vn/khao-thi/hvsv/xem-diem-thi.html', { waitUntil: 'networkidle2' });
+
+        console.log("Chọn hiển thị 'Tất cả' môn học...");
+        // Lệnh Promise.all này giúp trình duyệt đổi sang "Tất cả" (value '0') VÀ đợi trang load lại xong
+        await Promise.all([
+            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }),
+            page.select('#list_limit', '0')
+        ]);
+
+        console.log("Đang trích xuất mã HTML của bảng điểm...");
+        // Đợi cho cái bảng xuất hiện chắc chắn trên màn hình
+        await page.waitForSelector('table.table-bordered', { timeout: 10000 });
+        
+        // Dùng JavaScript để chỉ cắt đúng mã HTML của cái bảng (table), bỏ đi các phần râu ria (header, menu, footer...)
+        const tableHtml = await page.evaluate(() => {
+            const table = document.querySelector('table.table-bordered');
+            return table ? table.outerHTML : '<p>Không tìm thấy bảng điểm.</p>';
+        });
+
+        // Trả về đúng cái bảng điểm
+        res.status(200).send(tableHtml);
 
     } catch (error) {
         let errorMsg = `Lỗi: ${error.message}\n\n`;
