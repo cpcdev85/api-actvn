@@ -48,6 +48,32 @@ async function getBrowser() {
     return browser;
 }
 
+// ==========================================================
+// TỰ ĐỘNG THỬ LẠI KHI GẶP LỖI "Node is detached from document"
+// ==========================================================
+// Trang đăng nhập Microsoft là một SPA: sau khi DOM vừa tải xong, JS của
+// Microsoft có thể vẽ lại (thay thế) form đăng nhập để hiển thị branding của
+// trường (logo, tên tổ chức...). Nếu Puppeteer gõ/click đúng lúc phần tử cũ
+// vừa bị gỡ khỏi DOM để thay bằng phần tử mới, sẽ gặp lỗi "Node is detached
+// from document". Hàm này tự thử lại thao tác (truy vấn lại phần tử mới) một
+// vài lần thay vì để cả request thất bại ngay từ lỗi thoáng qua này.
+async function retryOnDetached(fn, { retries = 4, delayMs = 500 } = {}) {
+    let lastErr;
+    for (let i = 0; i <= retries; i++) {
+        try {
+            return await fn();
+        } catch (err) {
+            lastErr = err;
+            if (!/detached from document/i.test(err.message)) throw err;
+            if (i < retries) {
+                console.log(`[retry] Phần tử bị detach, thử lại lần ${i + 1}/${retries}...`);
+                await new Promise((r) => setTimeout(r, delayMs));
+            }
+        }
+    }
+    throw lastErr;
+}
+
 // Route cronjob đang gọi mỗi 15 phút để chống Render ngủ. Tiện thể "làm nóng"
 // luôn trình duyệt (đảm bảo Chromium đã khởi động sẵn) để lần lấy điểm đầu tiên
 // sau khi container mới khởi động (deploy lại / restart) không phải chờ bước
@@ -71,16 +97,18 @@ app.post('/api/login', async (req, res) => {
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
         // ==========================================================
-        // TỐI ƯU #2: CHẶN TẢI ẢNH/FONT/CSS KHÔNG CẦN THIẾT
+        // TỐI ƯU #2: CHẶN TẢI ẢNH/FONT/VIDEO KHÔNG CẦN THIẾT
         // ==========================================================
         // Ta chỉ cần đọc DOM (điền form, đọc bảng điểm) chứ không cần hiển thị
-        // giao diện đẹp -> chặn các tài nguyên nặng giúp trang tải nhanh hơn
-        // nhiều, đồng thời giúp các bước còn dùng "networkidle2" đạt điều kiện
-        // im lặng mạng sớm hơn (ít request nền hơn).
+        // giao diện đẹp -> chặn các tài nguyên nặng giúp trang tải nhanh hơn.
+        // LƯU Ý: KHÔNG chặn 'stylesheet' — trang đăng nhập Microsoft là SPA và có
+        // logic vẽ lại giao diện có thể phụ thuộc vào việc CSS tải xong, chặn CSS
+        // từng khiến trang render không ổn định (một phần nguyên nhân gây lỗi "Node
+        // is detached from document"). CSS nhẹ nên không đáng để đánh đổi.
         await page.setRequestInterception(true);
         page.on('request', (req) => {
             const type = req.resourceType();
-            if (['image', 'font', 'stylesheet', 'media'].includes(type)) {
+            if (['image', 'font', 'media'].includes(type)) {
                 req.abort();
             } else {
                 req.continue();
@@ -98,30 +126,34 @@ app.post('/api/login', async (req, res) => {
 
         if (msAuthUrl) {
             const cleanUrl = msAuthUrl.replace(/&amp;/g, '&');
-            await page.goto(cleanUrl, { waitUntil: 'domcontentloaded' });
+            // TRANG ĐĂNG NHẬP MICROSOFT LÀ SPA: sau domcontentloaded, JS của Microsoft
+            // còn tải branding của tenant trường rồi VẼ LẠI form đăng nhập. Nếu thao tác
+            // ngay lúc đó, dễ trúng đúng lúc phần tử cũ bị gỡ bỏ -> lỗi "detached from
+            // document". Domain login.microsoftonline.com không có nhiều tracker/script
+            // nền chạy mãi như trang trường, nên đợi 'networkidle0' ở đây vẫn đủ nhanh mà
+            // ổn định hơn nhiều so với domcontentloaded.
+            await page.goto(cleanUrl, { waitUntil: 'networkidle0', timeout: 30000 });
         } else {
             throw new Error('Không bóc tách được link Microsoft từ giao diện.');
         }
 
         log('Đợi form điền Email...');
-        // TỐI ƯU #3: bỏ waitUntil: 'networkidle2' + delay cứng setTimeout(2000ms) ở các
-        // bước dưới đây. Thay vào đó dùng waitForSelector để đợi ĐÚNG phần tử cần thiết
-        // xuất hiện — Puppeteer sẽ tự tiếp tục ngay khi phần tử sẵn sàng thay vì luôn
-        // phải chờ đủ một khoảng thời gian cố định hoặc chờ mạng "im hoàn toàn" (điều
-        // gần như không xảy ra vì các trang này luôn có script nền/analytics chạy liên tục).
+        // Bọc các thao tác gõ/click trên trang Microsoft bằng retryOnDetached: nếu
+        // Microsoft vẽ lại form đúng lúc ta đang thao tác, tự động truy vấn lại phần tử
+        // mới và thử lại thay vì để cả request thất bại vì một lỗi thoáng qua.
         await page.waitForSelector('input[name="loginfmt"]', { timeout: 20000 });
-        await page.type('input[name="loginfmt"]', username);
-        await page.click('input[id="idSIButton9"]');
+        await retryOnDetached(() => page.type('input[name="loginfmt"]', username));
+        await retryOnDetached(() => page.click('input[id="idSIButton9"]'));
 
         log('Đợi form điền Mật khẩu...');
         await page.waitForSelector('input[name="passwd"]', { visible: true, timeout: 20000 });
-        await page.type('input[name="passwd"]', password);
-        await page.click('input[id="idSIButton9"]');
+        await retryOnDetached(() => page.type('input[name="passwd"]', password));
+        await retryOnDetached(() => page.click('input[id="idSIButton9"]'));
 
         try {
             log('Kiểm tra màn hình "Duy trì đăng nhập"...');
             await page.waitForSelector('input[id="idSIButton9"]', { visible: true, timeout: 4000 });
-            await page.click('input[id="idSIButton9"]');
+            await retryOnDetached(() => page.click('input[id="idSIButton9"]'));
         } catch (e) { /* Không có màn hình này thì bỏ qua */ }
 
         log('Chờ đăng nhập hoàn tất, quay về trang trường...');
