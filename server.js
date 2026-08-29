@@ -3,8 +3,57 @@ const puppeteer = require('puppeteer');
 const app = express();
 
 app.use(express.json());
-// THÊM ĐOẠN NÀY ĐỂ NHẬN BÁO THỨC
-app.get('/', (req, res) => {
+
+// ==========================================================
+// TỐI ƯU #1 (quan trọng nhất): TÁI SỬ DỤNG 1 TRÌNH DUYỆT DUY NHẤT
+// ==========================================================
+// Bản gốc: mỗi request gọi puppeteer.launch() rồi browser.close() ở finally
+// -> mỗi lần lấy điểm phải khởi động lại Chromium từ đầu. Trên Render free tier
+// (CPU bị giới hạn ~0.1 vCPU), riêng bước khởi động Chromium có thể tốn 5-20 giây.
+// Bản này: khởi động Chromium 1 LẦN duy nhất khi server start, giữ sống xuyên suốt.
+// Mỗi request chỉ mở/đóng "page" (rất nhanh, <1s) thay vì mở/đóng cả "browser".
+let browserPromise = null;
+
+function launchBrowser() {
+    console.log('[browser] Đang khởi động Chromium...');
+    return puppeteer.launch({
+        headless: true,
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || null,
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-blink-features=AutomationControlled',
+            // Các cờ dưới đây giảm tải CPU/RAM khi chạy trong container giới hạn
+            // tài nguyên như Render free tier -> Chromium khởi động & chạy nhanh hơn.
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '--no-zygote',
+            '--disable-extensions',
+        ],
+    });
+}
+
+async function getBrowser() {
+    if (!browserPromise) {
+        browserPromise = launchBrowser();
+    }
+    let browser = await browserPromise;
+    // Nếu trình duyệt bị crash/đóng (VD: hết RAM), tự khởi động lại ở lần gọi kế tiếp
+    // thay vì để mọi request sau đó lỗi mãi.
+    if (!browser.isConnected()) {
+        console.log('[browser] Trình duyệt cũ đã ngắt kết nối, khởi động lại...');
+        browserPromise = launchBrowser();
+        browser = await browserPromise;
+    }
+    return browser;
+}
+
+// Route cronjob đang gọi mỗi 15 phút để chống Render ngủ. Tiện thể "làm nóng"
+// luôn trình duyệt (đảm bảo Chromium đã khởi động sẵn) để lần lấy điểm đầu tiên
+// sau khi container mới khởi động (deploy lại / restart) không phải chờ bước
+// khởi động Chromium (bước tốn thời gian nhất).
+app.get('/', async (req, res) => {
+    getBrowser().catch(err => console.error('[warmup] Lỗi khởi động trình duyệt:', err.message));
     res.status(200).send('Máy chủ đang thức!');
 });
 
@@ -12,28 +61,36 @@ app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
     if (!username || !password) return res.status(400).send('Thiếu thông tin');
 
-    let browser = null;
     let page = null;
-    
+    const t0 = Date.now();
+    const log = (msg) => console.log(`[+${((Date.now() - t0) / 1000).toFixed(1)}s] ${msg}`);
+
     try {
-        console.log("Khởi động trình duyệt...");
-        browser = await puppeteer.launch({
-            headless: true,
-            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || null,
-            args: [
-                '--no-sandbox', 
-                '--disable-setuid-sandbox',
-                '--disable-blink-features=AutomationControlled'
-            ]
-        });
-        
+        const browser = await getBrowser();
         page = await browser.newPage();
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
-        console.log("Truy cập trang chủ trường...");
+        // ==========================================================
+        // TỐI ƯU #2: CHẶN TẢI ẢNH/FONT/CSS KHÔNG CẦN THIẾT
+        // ==========================================================
+        // Ta chỉ cần đọc DOM (điền form, đọc bảng điểm) chứ không cần hiển thị
+        // giao diện đẹp -> chặn các tài nguyên nặng giúp trang tải nhanh hơn
+        // nhiều, đồng thời giúp các bước còn dùng "networkidle2" đạt điều kiện
+        // im lặng mạng sớm hơn (ít request nền hơn).
+        await page.setRequestInterception(true);
+        page.on('request', (req) => {
+            const type = req.resourceType();
+            if (['image', 'font', 'stylesheet', 'media'].includes(type)) {
+                req.abort();
+            } else {
+                req.continue();
+            }
+        });
+
+        log('Truy cập trang chủ trường...');
         await page.goto('https://ktdbcl.actvn.edu.vn/dang-nhap.html', { waitUntil: 'domcontentloaded' });
 
-        console.log("Đang bóc tách link đăng nhập Microsoft...");
+        log('Đang bóc tách link đăng nhập Microsoft...');
         const msAuthUrl = await page.evaluate(() => {
             const btn = document.querySelector('button[data-socialurl*="login.microsoftonline.com"]');
             return btn ? btn.getAttribute('data-socialurl') : null;
@@ -43,52 +100,56 @@ app.post('/api/login', async (req, res) => {
             const cleanUrl = msAuthUrl.replace(/&amp;/g, '&');
             await page.goto(cleanUrl, { waitUntil: 'domcontentloaded' });
         } else {
-            throw new Error("Không bóc tách được link Microsoft từ giao diện.");
+            throw new Error('Không bóc tách được link Microsoft từ giao diện.');
         }
 
-        console.log("Đợi form điền Email...");
-        await page.waitForSelector('input[name="loginfmt"]', { timeout: 30000 });
+        log('Đợi form điền Email...');
+        // TỐI ƯU #3: bỏ waitUntil: 'networkidle2' + delay cứng setTimeout(2000ms) ở các
+        // bước dưới đây. Thay vào đó dùng waitForSelector để đợi ĐÚNG phần tử cần thiết
+        // xuất hiện — Puppeteer sẽ tự tiếp tục ngay khi phần tử sẵn sàng thay vì luôn
+        // phải chờ đủ một khoảng thời gian cố định hoặc chờ mạng "im hoàn toàn" (điều
+        // gần như không xảy ra vì các trang này luôn có script nền/analytics chạy liên tục).
+        await page.waitForSelector('input[name="loginfmt"]', { timeout: 20000 });
         await page.type('input[name="loginfmt"]', username);
         await page.click('input[id="idSIButton9"]');
 
-        await new Promise(r => setTimeout(r, 2000));
-        
-        console.log("Đợi form điền Mật khẩu...");
-        await page.waitForSelector('input[name="passwd"]', { visible: true, timeout: 30000 });
+        log('Đợi form điền Mật khẩu...');
+        await page.waitForSelector('input[name="passwd"]', { visible: true, timeout: 20000 });
         await page.type('input[name="passwd"]', password);
         await page.click('input[id="idSIButton9"]');
 
         try {
-            await page.waitForSelector('input[id="idSIButton9"]', { visible: true, timeout: 5000 });
+            log('Kiểm tra màn hình "Duy trì đăng nhập"...');
+            await page.waitForSelector('input[id="idSIButton9"]', { visible: true, timeout: 4000 });
             await page.click('input[id="idSIButton9"]');
-        } catch (e) { }
+        } catch (e) { /* Không có màn hình này thì bỏ qua */ }
 
-        console.log("Chờ đăng nhập hoàn tất...");
-        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 });
+        log('Chờ đăng nhập hoàn tất, quay về trang trường...');
+        // Đây vẫn cần chờ điều hướng thật sự (đăng nhập xong -> redirect về trường),
+        // nhưng đổi 'networkidle2' -> 'domcontentloaded' để không phải chờ thêm các
+        // request nền không liên quan sau khi DOM đã sẵn sàng.
+        await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 });
 
-        // --- PHẦN MỚI: XỬ LÝ LẤY ĐIỂM ---
-        
-        console.log("Đang chuyển hướng sang trang xem điểm...");
-        await page.goto('https://ktdbcl.actvn.edu.vn/khao-thi/hvsv/xem-diem-thi.html', { waitUntil: 'networkidle2' });
+        // --- PHẦN LẤY ĐIỂM ---
 
-        console.log("Chọn hiển thị 'Tất cả' môn học...");
-        // Lệnh Promise.all này giúp trình duyệt đổi sang "Tất cả" (value '0') VÀ đợi trang load lại xong
+        log('Đang chuyển hướng sang trang xem điểm...');
+        await page.goto('https://ktdbcl.actvn.edu.vn/khao-thi/hvsv/xem-diem-thi.html', { waitUntil: 'domcontentloaded' });
+
+        log('Chọn hiển thị "Tất cả" môn học...');
         await Promise.all([
-            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }),
-            page.select('#list_limit', '0')
+            page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }),
+            page.select('#list_limit', '0'),
         ]);
 
-        console.log("Đang trích xuất mã HTML của bảng điểm...");
-        // Đợi cho cái bảng xuất hiện chắc chắn trên màn hình
+        log('Đang trích xuất mã HTML của bảng điểm...');
         await page.waitForSelector('table.table-bordered', { timeout: 10000 });
-        
-        // Dùng JavaScript để chỉ cắt đúng mã HTML của cái bảng (table), bỏ đi các phần râu ria (header, menu, footer...)
+
         const tableHtml = await page.evaluate(() => {
             const table = document.querySelector('table.table-bordered');
             return table ? table.outerHTML : '<p>Không tìm thấy bảng điểm.</p>';
         });
 
-        // Trả về đúng cái bảng điểm
+        log('Hoàn tất.');
         res.status(200).send(tableHtml);
 
     } catch (error) {
@@ -98,13 +159,20 @@ app.post('/api/login', async (req, res) => {
                 const currentUrl = await page.url();
                 errorMsg += `--- GÓC DEBUG ---\n`;
                 errorMsg += `URL khi bị kẹt: ${currentUrl}\n\n`;
-            } catch (e) {}
+            } catch (e) { }
         }
         res.status(500).send(errorMsg);
     } finally {
-        if (browser) await browser.close();
+        // CHỈ đóng "page" (tab), KHÔNG đóng "browser" — trình duyệt được giữ sống
+        // xuyên suốt để phục vụ các request tiếp theo (xem TỐI ƯU #1 ở đầu file).
+        if (page) {
+            try { await page.close(); } catch (e) { }
+        }
     }
 });
+
+// Khởi động sẵn trình duyệt ngay khi server start, thay vì đợi đến request đầu tiên.
+getBrowser().catch(err => console.error('[startup] Lỗi khởi động trình duyệt:', err.message));
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log('Server chạy tại port ' + port));
