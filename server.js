@@ -168,6 +168,10 @@ app.post('/api/login', async (req, res) => {
         await page.goto('https://ktdbcl.actvn.edu.vn/khao-thi/hvsv/xem-diem-thi.html', { waitUntil: 'domcontentloaded' });
 
         log('Chọn hiển thị "Tất cả" môn học...');
+        // Dropdown #list_limit được trang tiêm vào DOM bằng JS sau khi tải xong (không có
+        // sẵn ngay lúc domcontentloaded) -> phải đợi nó xuất hiện trước khi gọi page.select,
+        // nếu không sẽ gặp lỗi "No element found for selector: #list_limit".
+        await page.waitForSelector('#list_limit', { timeout: 15000 });
         await Promise.all([
             page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }),
             page.select('#list_limit', '0'),
