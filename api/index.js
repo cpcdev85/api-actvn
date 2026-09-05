@@ -1,33 +1,12 @@
 const puppeteer = require('puppeteer-core');
 const chromium = require('@sparticuz/chromium');
 
-// ============================================================
-// BẢO MẬT: cùng 1 secret dùng chung với server.js (đặt biến môi trường API_SECRET trong
-// Vercel > Project Settings > Environment Variables - PHẢI GIỐNG giá trị đặt trên Render).
-// GHI CHÚ QUAN TRỌNG: không thêm rate-limit lưu trong RAM ở đây như server.js, vì mỗi lần gọi
-// hàm serverless trên Vercel CÓ THỂ khởi tạo 1 instance MỚI hoàn toàn (biến toàn cục trong RAM
-// không đảm bảo được giữ lại giữa các lần gọi) - 1 bộ đếm dùng Map() ở đây sẽ không đáng tin
-// cậy, dễ tạo cảm giác an toàn giả. Nếu bạn dùng đường Vercel này làm chính (không chỉ dự
-// phòng), nên rate-limit ở 1 nơi có trạng thái bền hơn (VD: Vercel KV / Upstash Redis) thay vì
-// biến trong RAM của hàm serverless.
-// ============================================================
-const API_SECRET = process.env.API_SECRET || '';
-
 module.exports = async (req, res) => {
     // Chỉ nhận request dạng POST từ PHP
     if (req.method !== 'POST') {
         return res.status(405).send('Vui lòng sử dụng phương thức POST');
     }
-
-    // Chặn người lạ gọi thẳng endpoint (bỏ qua diem_fetch.php) bằng secret dùng chung.
-    if (!API_SECRET) {
-        console.error('LỖI CẤU HÌNH: chưa đặt biến môi trường API_SECRET trên Vercel - từ chối toàn bộ request để tránh public mở toang.');
-        return res.status(500).send('Máy chủ chưa cấu hình bảo mật (API_SECRET).');
-    }
-    if (req.headers['x-api-secret'] !== API_SECRET) {
-        return res.status(403).send('Forbidden');
-    }
-
+    
     // Lấy tài khoản/mật khẩu từ body
     const { username, password } = req.body;
     if (!username || !password) {
