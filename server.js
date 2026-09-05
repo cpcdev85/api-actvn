@@ -108,6 +108,18 @@ app.post('/api/login', async (req, res) => {
             const cleanUrl = msAuthUrl.replace(/&amp;/g, '&');
             await page.goto(cleanUrl, { waitUntil: 'domcontentloaded' });
         } else {
+            // DEBUG TẠM THỜI: in ra 1000 ký tự đầu của HTML trang lúc đó vào log Render, để
+            // xác định xem trang đã đổi giao diện, chưa load kịp, hay bị chặn bot. Log này
+            // KHÔNG lộ ra ngoài cho client (chỉ xem được qua Render > Logs), và không chứa
+            // username/password. Sau khi xác định xong nguyên nhân, nên xoá đoạn debug này.
+            try {
+                const debugHtml = await page.content();
+                console.log("=== DEBUG: không tìm thấy nút Microsoft, 1000 ký tự đầu của trang ===");
+                console.log(debugHtml.slice(0, 1000));
+                console.log("=== HẾT DEBUG ===");
+            } catch (e) {
+                console.log("DEBUG: không lấy được page.content() để in log:", e.message);
+            }
             throw new Error("Không bóc tách được link Microsoft từ giao diện.");
         }
 
