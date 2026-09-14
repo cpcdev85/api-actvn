@@ -10,7 +10,7 @@ app.get('/', (req, res) => {
 
 app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
-    if (!username || !password) return res.status(400).send('Thiếu thông tin');
+    if (!username || !password) return res.status(400).json({ status: 'bad_request', message: 'Thiếu thông tin' });
 
     let browser = null;
     let page = null;
@@ -56,10 +56,28 @@ app.post('/api/login', async (req, res) => {
         console.log("Đợi form điền Mật khẩu...");
         await page.waitForSelector('input[name="passwd"]', { visible: true, timeout: 30000 });
         await page.type('input[name="passwd"]', password);
+
+        // Nếu sai mật khẩu, Microsoft KHÔNG điều hướng trang mà hiện lỗi ngay tại
+        // chỗ (id="passwordError"). Bắt song song 2 khả năng: điều hướng thành công
+        // HOẶC xuất hiện lỗi sai mật khẩu, để không phải đợi timeout 30s vô ích và để
+        // trả đúng thông báo "sai mật khẩu" thay vì lỗi chung chung.
         await page.click('input[id="idSIButton9"]');
 
+        const passwordErrorEl = await Promise.race([
+            page.waitForSelector('#passwordError', { visible: true, timeout: 15000 }).then(() => 'wrong_password'),
+            page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).then(() => 'navigated').catch(() => null),
+        ]);
+
+        if (passwordErrorEl === 'wrong_password') {
+            const msg = await page.$eval('#passwordError', el => el.textContent.trim()).catch(() => 'Sai mật khẩu.');
+            return res.status(401).json({ success: false, message: msg || 'Sai tài khoản hoặc mật khẩu.' });
+        }
+
+        // Màn hình phụ hay gặp sau khi nhập đúng mật khẩu: "Stay signed in?" / "Duy trì
+        // đăng nhập?" / thông báo giảm số lần đăng nhập. Đợi rộng rãi hơn (10s thay vì 5s)
+        // vì màn hình này có thể xuất hiện hơi trễ.
         try {
-            await page.waitForSelector('input[id="idSIButton9"]', { visible: true, timeout: 5000 });
+            await page.waitForSelector('input[id="idSIButton9"]', { visible: true, timeout: 10000 });
             await page.click('input[id="idSIButton9"]');
         } catch (e) { }
 
@@ -92,15 +110,23 @@ app.post('/api/login', async (req, res) => {
         res.status(200).send(tableHtml);
 
     } catch (error) {
-        let errorMsg = `Lỗi: ${error.message}\n\n`;
+        let debugUrl = null;
         if (page) {
-            try {
-                const currentUrl = await page.url();
-                errorMsg += `--- GÓC DEBUG ---\n`;
-                errorMsg += `URL khi bị kẹt: ${currentUrl}\n\n`;
-            } catch (e) {}
+            try { debugUrl = await page.url(); } catch (e) {}
         }
-        res.status(500).send(errorMsg);
+        console.error('[api/login] Lỗi:', error.message, '| URL khi bị kẹt:', debugUrl);
+
+        // QUAN TRỌNG: trả JSON (không phải text thuần) để phía diem_fetch.php parse được
+        // và KHÔNG dùng key 'success'/'error' ở đây, vì diem_fetch.php coi 2 key đó là
+        // "chắc chắn sai tài khoản/mật khẩu" và sẽ tính vào bộ đếm chống dò mật khẩu -
+        // trong khi đây là lỗi automation (timeout, đổi giao diện, MFA...), không liên
+        // quan gì đến việc user gõ sai mật khẩu.
+        res.status(502).json({
+            status: 'automation_error',
+            message: 'Không tự động lấy được điểm do lỗi hệ thống (có thể do timeout, trang khảo thí thay đổi giao diện, hoặc tài khoản yêu cầu xác thực 2 bước). Vui lòng thử lại sau hoặc dùng cách Thủ công.',
+            debug: error.message,
+            stuckUrl: debugUrl,
+        });
     } finally {
         if (browser) await browser.close();
     }
