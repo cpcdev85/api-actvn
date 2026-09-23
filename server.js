@@ -77,24 +77,44 @@ app.post('/api/login', async (req, res) => {
         // đăng nhập?" / thông báo giảm số lần đăng nhập. Đợi rộng rãi hơn (10s thay vì 5s)
         // vì màn hình này có thể xuất hiện hơi trễ.
         try {
-            await page.waitForSelector('input[id="idSIButton9"]', { visible: true, timeout: 10000 });
+            await page.waitForSelector('input[id="idSIButton9"]', { visible: true, timeout: 8000 });
             await page.click('input[id="idSIButton9"]');
-        } catch (e) { }
-
+        } catch (e) { /* không có màn hình này, bỏ qua */ }
+        
         console.log("Chờ đăng nhập hoàn tất...");
-        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 });
-
-        // --- PHẦN MỚI: XỬ LÝ LẤY ĐIỂM ---
+        // domcontentloaded thay vì networkidle2 — nhanh & không bị treo bởi script nền.
+        // Nếu không có navigation nào xảy ra (VD site không redirect ngay), cũng KHÔNG throw —
+        // vì bước tiếp theo (goto thẳng trang điểm) sẽ tự xử lý được cả 2 trường hợp.
+        try {
+            await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 });
+        } catch (e) {
+            console.log("Không có navigation sau đăng nhập (có thể đã ở sẵn trang đích), tiếp tục...");
+        }
         
         console.log("Đang chuyển hướng sang trang xem điểm...");
-        await page.goto('https://ktdbcl.actvn.edu.vn/khao-thi/hvsv/xem-diem-thi.html', { waitUntil: 'networkidle2' });
-
+        await page.goto('https://ktdbcl.actvn.edu.vn/khao-thi/hvsv/xem-diem-thi.html', {
+            waitUntil: 'domcontentloaded',
+            timeout: 20000,
+        });
+        
+        // Nếu bị đá về trang đăng nhập -> login thực sự thất bại (session bị từ chối, MFA, v.v.)
+        // Trả lỗi rõ ràng thay vì để rơi vào automation_error chung chung.
+        if (page.url().includes('dang-nhap.html')) {
+            return res.status(401).json({
+                success: false,
+                message: 'Đăng nhập không thành công (có thể do sai mật khẩu, tài khoản yêu cầu xác thực 2 bước, hoặc phiên bị từ chối).',
+            });
+        }
+        
         console.log("Chọn hiển thị 'Tất cả' môn học...");
-        // Lệnh Promise.all này giúp trình duyệt đổi sang "Tất cả" (value '0') VÀ đợi trang load lại xong
-        await Promise.all([
-            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }),
-            page.select('#list_limit', '0')
-        ]);
+        try {
+            await Promise.all([
+                page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }),
+                page.select('#list_limit', '0'),
+            ]);
+        } catch (e) {
+            console.log("Chọn filter không kích hoạt navigation mới, tiếp tục lấy dữ liệu hiện có...");
+        }
 
         console.log("Đang trích xuất mã HTML của bảng điểm...");
         // Đợi cho cái bảng xuất hiện chắc chắn trên màn hình
