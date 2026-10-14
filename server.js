@@ -14,12 +14,34 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let T0 = Date.now();
 const log = (m) => console.log(`[+${((Date.now() - T0) / 1000).toFixed(1)}s] ${m}`);
 
-// Render free chỉ có ~512MB RAM -> chỉ cho chạy 1 trình duyệt tại 1 thời điểm
+// Chỉ giữ origin + path của URL khi ghi log / trả lỗi. Phần query (?code=...&state=...) của
+// trang callback OAuth chứa mã xác thực tạm thời, không nên lọt vào log Render hay response.
+function safeUrl(u) {
+    try { const x = new URL(u); return x.origin + x.pathname; } catch (e) { return '(không rõ)'; }
+}
+
+// Render free chỉ có ~512MB RAM -> chỉ cho chạy 1 trình duyệt tại 1 thời điểm.
+// Hàng đợi có giới hạn: quá MAX_PENDING yêu cầu đang chờ thì từ chối ngay (chống tràn RAM/DoS).
+const MAX_PENDING = 3;
+let pending = 0;
+let active = 0; // số request đang chạy (để không đóng Chrome giữa chừng)
 let queue = Promise.resolve();
 function runExclusive(task) {
-    const run = queue.then(task, task);
+    pending++;
+    const run = queue.then(task, task).finally(() => { pending--; });
     queue = run.catch(() => {});
     return run;
+}
+
+// Khóa bí mật (tùy chọn). Đặt biến môi trường API_KEY trên Render, PHP gửi cùng giá trị trong
+// header X-Api-Key. Nếu chưa đặt API_KEY thì bỏ qua kiểm tra (để không làm hỏng hệ thống đang chạy).
+const API_KEY = process.env.API_KEY || '';
+function requireApiKey(req, res, next) {
+    if (!API_KEY) return next();
+    const got = String(req.get('x-api-key') || '');
+    const a = Buffer.from(got), b = Buffer.from(API_KEY);
+    if (a.length === b.length && require('crypto').timingSafeEqual(a, b)) return next();
+    return res.status(401).json({ status: 'automation_error', message: 'Unauthorized' });
 }
 
 // Lỗi mà ta biết chắc nguyên nhân -> trả đúng status/body cho PHP
@@ -31,7 +53,51 @@ class ApiError extends Error {
     }
 }
 
-app.get('/', (req, res) => res.status(200).send('Máy chủ đang thức!'));
+// ---- Trình duyệt dùng chung: chỉ mở 1 lần, các request sau dùng lại (tiết kiệm ~9s) ----
+// Mỗi request dùng 1 browser context riêng (như cửa sổ ẩn danh) nên cookie/phiên
+// đăng nhập của các sinh viên KHÔNG bị lẫn nhau, và bị xóa sạch khi xong.
+let sharedBrowser = null;
+let launching = null; // Promise đang mở Chrome - tránh 2 nơi cùng mở 2 Chrome (rò rỉ RAM)
+let idleTimer = null;
+async function getBrowser() {
+    if (sharedBrowser && sharedBrowser.connected) return sharedBrowser;
+    if (launching) return launching;
+    launching = launchBrowser().finally(() => { launching = null; });
+    return launching;
+}
+async function launchBrowser() {
+    log('Khởi động trình duyệt...');
+    sharedBrowser = await puppeteer.launch({
+        headless: true,
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '--disable-extensions',
+            '--mute-audio',
+            '--no-first-run',
+            '--disable-blink-features=AutomationControlled',
+        ],
+    });
+    sharedBrowser.on('disconnected', () => { sharedBrowser = null; });
+    return sharedBrowser;
+}
+// Không có request trong 3 phút thì đóng Chrome để nhả RAM
+function scheduleIdleClose() {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(async () => {
+        if (active > 0 || pending > 0) return scheduleIdleClose(); // đang bận -> hẹn lại
+        if (sharedBrowser) { await sharedBrowser.close().catch(() => {}); sharedBrowser = null; }
+    }, 3 * 60 * 1000);
+}
+
+// Gọi vào "/" (ping đánh thức Render) cũng mở sẵn Chrome luôn
+app.get('/', (req, res) => {
+    res.status(200).send('Máy chủ đang thức!');
+    if (active === 0 && pending === 0) getBrowser().then(scheduleIdleClose).catch(() => {});
+});
 
 // ---------------------------------------------------------------
 // B1: Đăng nhập trang khảo thí bằng "Sign in with Microsoft"
@@ -49,7 +115,7 @@ async function goToMicrosoftLogin(page) {
     if (socialUrl) {
         log('Có link Microsoft, đang chuyển sang login.microsoftonline.com');
         await page.goto(socialUrl.replace(/&amp;/g, '&'), { waitUntil: 'domcontentloaded', timeout: 60000 });
-        log('Đã tới trang Microsoft: ' + page.url().slice(0, 80));
+        log('Đã tới trang Microsoft: ' + safeUrl(page.url()));
         return;
     }
 
@@ -71,7 +137,7 @@ async function microsoftLogin(page, username, password) {
     // --- Email ---
     await page.waitForSelector('input[name="loginfmt"]', { visible: true, timeout: 45000 });
     log('Điền email');
-    await page.type('input[name="loginfmt"]', username, { delay: 10 });
+    await page.type('input[name="loginfmt"]', username, { delay: 0 });
     await page.click('#idSIButton9');
 
     // Đợi: hoặc hiện ô mật khẩu, hoặc báo sai email
@@ -94,7 +160,7 @@ async function microsoftLogin(page, username, password) {
     // --- Mật khẩu ---
     await sleep(500); // đợi hiệu ứng trượt của Microsoft
     log('Điền mật khẩu');
-    await page.type('input[name="passwd"]', password, { delay: 10 });
+    await page.type('input[name="passwd"]', password, { delay: 0 });
     await page.click('#idSIButton9');
     log('Đã bấm đăng nhập, chờ chuyển về khảo thí');
 
@@ -126,7 +192,7 @@ async function microsoftLogin(page, username, password) {
         }).catch(() => ({ type: 'wait' })); // trang đang điều hướng -> thử lại
 
         if (st.type !== lastState) {
-            log('Trạng thái: ' + st.type + ' | ' + page.url().slice(0, 90));
+            log('Trạng thái: ' + st.type + ' | ' + safeUrl(page.url()));
             lastState = st.type;
         }
         if (st.type === 'wrong_password') {
@@ -147,13 +213,16 @@ async function microsoftLogin(page, username, password) {
     let finalHost = '';
     try { finalHost = new URL(page.url()).hostname; } catch (e) {}
     if (finalHost !== 'ktdbcl.actvn.edu.vn') {
-        throw new Error('Hết thời gian chờ đăng nhập Microsoft (URL hiện tại: ' + page.url() + ')');
+        throw new Error('Hết thời gian chờ đăng nhập Microsoft (URL hiện tại: ' + safeUrl(page.url()) + ')');
     }
 
     // Đợi trang callback của Joomla xử lý xong phiên đăng nhập rồi mới đi tiếp
-    await page.waitForFunction(() => document.readyState === 'complete', { timeout: 20000 }).catch(() => {});
-    await page.waitForNetworkIdle({ idleTime: 800, timeout: 15000 }).catch(() => {});
-    log('Đăng nhập xong, đang ở: ' + page.url());
+    // (không chờ networkidle nữa - tốn ~18s vô ích; chỉ cần chắc không còn ở trang callback)
+    await page.waitForFunction(
+        () => document.readyState !== 'loading' && !/index\.php/i.test(location.pathname),
+        { timeout: 8000 }
+    ).catch(() => {});
+    log('Đăng nhập xong, đang ở: ' + safeUrl(page.url()));
 }
 
 // ---------------------------------------------------------------
@@ -165,7 +234,7 @@ const hasGradeTable = () => {
 
 async function openGradesPage(page) {
     await page.goto(GRADES_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    log('Đã mở trang điểm, URL: ' + page.url());
+    log('Đã mở trang điểm, URL: ' + safeUrl(page.url()));
 
     // Nếu bị đá về trang đăng nhập => chưa đăng nhập được
     if (/dang-nhap/i.test(page.url())) {
@@ -173,7 +242,7 @@ async function openGradesPage(page) {
     }
 
     await page.waitForFunction(hasGradeTable, { timeout: 30000 }).catch(() => {
-        throw new Error('Không thấy bảng điểm trên trang ' + page.url());
+        throw new Error('Không thấy bảng điểm trên trang ' + safeUrl(page.url()));
     });
 
     // Đổi "số dòng / trang" (đang là 20) sang "Tất cả"
@@ -242,34 +311,35 @@ async function extractGrades(page) {
 }
 
 // ---------------------------------------------------------------
-app.post('/api/login', (req, res) => {
+app.post('/api/login', requireApiKey, (req, res) => {
     const { username, password } = req.body || {};
-    if (!username || !password) {
+    if (typeof username !== 'string' || typeof password !== 'string' || !username || !password) {
         return res.status(400).json({ status: 'bad_request', message: 'Thiếu thông tin' });
     }
+    if (username.length > 100 || password.length > 255) {
+        return res.status(400).json({ status: 'bad_request', message: 'Thông tin không hợp lệ' });
+    }
+    if (pending >= MAX_PENDING) {
+        return res.status(503).json({ status: 'automation_error', message: 'Hệ thống đang bận, vui lòng thử lại sau ít phút.' });
+    }
+
+    // Nếu bên gọi (PHP) đã ngắt kết nối trong lúc chờ tới lượt thì khỏi chạy nữa
+    let clientGone = false;
+    res.on('close', () => { if (!res.writableEnded) clientGone = true; });
 
     runExclusive(async () => {
-        let browser = null;
+        if (clientGone) return;
+        let context = null;
         let page = null;
         T0 = Date.now();
+        active++;
+        clearTimeout(idleTimer);
         try {
-            log('Khởi động trình duyệt...');
-            browser = await puppeteer.launch({
-                headless: true,
-                executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-                args: [
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-gpu',
-                    '--disable-extensions',
-                    '--mute-audio',
-                    '--no-first-run',
-                    '--disable-blink-features=AutomationControlled',
-                ],
-            });
-
-            page = await browser.newPage();
+            const browser = await getBrowser();
+            context = browser.createBrowserContext
+                ? await browser.createBrowserContext()
+                : await browser.createIncognitoBrowserContext();
+            page = await context.newPage();
             await page.setUserAgent(
                 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             );
@@ -310,7 +380,7 @@ app.post('/api/login', (req, res) => {
                 return res.status(error.httpStatus).json(error.body);
             }
             let debugUrl = null;
-            if (page) { try { debugUrl = page.url(); } catch (e) {} }
+            if (page) { try { debugUrl = safeUrl(page.url()); } catch (e) {} }
             console.error('[api/login] Lỗi:', error.message, '| URL:', debugUrl);
 
             // KHÔNG dùng key 'success'/'error' ở đây vì diem_fetch.php coi đó là "sai mật khẩu"
@@ -321,7 +391,9 @@ app.post('/api/login', (req, res) => {
                 stuckUrl: debugUrl,
             });
         } finally {
-            if (browser) await browser.close().catch(() => {});
+            if (context) await context.close().catch(() => {});
+            active--;
+            scheduleIdleClose();
         }
     });
 });
