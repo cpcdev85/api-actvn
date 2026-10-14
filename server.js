@@ -87,7 +87,7 @@ app.post('/api/login', async (req, res) => {
         // --- PHẦN MỚI: XỬ LÝ LẤY ĐIỂM ---
         
         console.log("Đang chuyển hướng sang trang xem điểm...");
-        await page.goto('https://ktdbcl.actvn.edu.vn/khao-thi/hvsv/xem-diem-thi.html', { waitUntil: 'networkidle2' });
+        await page.goto('https://ktdbcl.actvn.edu.vn/hvsv.html?view=learnerexams', { waitUntil: 'networkidle2' });
 
         console.log("Chọn hiển thị 'Tất cả' môn học...");
         // Lệnh Promise.all này giúp trình duyệt đổi sang "Tất cả" (value '0') VÀ đợi trang load lại xong
