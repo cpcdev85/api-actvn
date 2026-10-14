@@ -10,6 +10,10 @@ const GRADES_URL = BASE + '/hvsv.html?view=learnerexams';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Log kèm số giây đã trôi qua từ lúc bắt đầu request (mỗi lần chỉ chạy 1 request nên dùng biến chung được)
+let T0 = Date.now();
+const log = (m) => console.log(`[+${((Date.now() - T0) / 1000).toFixed(1)}s] ${m}`);
+
 // Render free chỉ có ~512MB RAM -> chỉ cho chạy 1 trình duyệt tại 1 thời điểm
 let queue = Promise.resolve();
 function runExclusive(task) {
@@ -33,7 +37,9 @@ app.get('/', (req, res) => res.status(200).send('Máy chủ đang thức!'));
 // B1: Đăng nhập trang khảo thí bằng "Sign in with Microsoft"
 // ---------------------------------------------------------------
 async function goToMicrosoftLogin(page) {
-    await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    log('Mở ' + LOGIN_URL);
+    await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    log('Đã mở trang đăng nhập khảo thí');
 
     // Cách 1: nút Microsoft có sẵn link OAuth trong data-socialurl (cách cũ, nhanh nhất)
     const socialUrl = await page.evaluate(() => {
@@ -41,10 +47,13 @@ async function goToMicrosoftLogin(page) {
         return el ? el.getAttribute('data-socialurl') : null;
     });
     if (socialUrl) {
-        await page.goto(socialUrl.replace(/&amp;/g, '&'), { waitUntil: 'domcontentloaded', timeout: 45000 });
+        log('Có link Microsoft, đang chuyển sang login.microsoftonline.com');
+        await page.goto(socialUrl.replace(/&amp;/g, '&'), { waitUntil: 'domcontentloaded', timeout: 60000 });
+        log('Đã tới trang Microsoft: ' + page.url().slice(0, 80));
         return;
     }
 
+    log('Không thấy data-socialurl, thử bấm nút theo chữ');
     // Cách 2 (dự phòng): tìm nút có chữ "Sign in with Microsoft" rồi bấm
     const nav = page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => null);
     const clicked = await page.evaluate(() => {
@@ -60,8 +69,9 @@ async function goToMicrosoftLogin(page) {
 
 async function microsoftLogin(page, username, password) {
     // --- Email ---
-    await page.waitForSelector('input[name="loginfmt"]', { visible: true, timeout: 30000 });
-    await page.type('input[name="loginfmt"]', username, { delay: 20 });
+    await page.waitForSelector('input[name="loginfmt"]', { visible: true, timeout: 45000 });
+    log('Điền email');
+    await page.type('input[name="loginfmt"]', username, { delay: 10 });
     await page.click('#idSIButton9');
 
     // Đợi: hoặc hiện ô mật khẩu, hoặc báo sai email
@@ -75,6 +85,7 @@ async function microsoftLogin(page, username, password) {
         return false;
     }, { timeout: 30000, polling: 300 })).jsonValue();
 
+    log('Sau bước email: ' + step);
     if (step === 'username_error') {
         const msg = await page.$eval('#usernameError', (el) => el.textContent.trim()).catch(() => '');
         throw new ApiError(401, { success: false, message: msg || 'Tài khoản không tồn tại.' });
@@ -82,11 +93,14 @@ async function microsoftLogin(page, username, password) {
 
     // --- Mật khẩu ---
     await sleep(500); // đợi hiệu ứng trượt của Microsoft
-    await page.type('input[name="passwd"]', password, { delay: 20 });
+    log('Điền mật khẩu');
+    await page.type('input[name="passwd"]', password, { delay: 10 });
     await page.click('#idSIButton9');
+    log('Đã bấm đăng nhập, chờ chuyển về khảo thí');
 
     // --- Chờ về lại trang khảo thí, xử lý các màn hình phụ ---
-    const deadline = Date.now() + 60000;
+    let lastState = '';
+    const deadline = Date.now() + 75000;
     while (Date.now() < deadline) {
         let host = '';
         try { host = new URL(page.url()).hostname; } catch (e) {}
@@ -111,6 +125,10 @@ async function microsoftLogin(page, username, password) {
             return { type: 'wait' };
         }).catch(() => ({ type: 'wait' })); // trang đang điều hướng -> thử lại
 
+        if (st.type !== lastState) {
+            log('Trạng thái: ' + st.type + ' | ' + page.url().slice(0, 90));
+            lastState = st.type;
+        }
         if (st.type === 'wrong_password') {
             throw new ApiError(401, { success: false, message: st.msg || 'Sai tài khoản hoặc mật khẩu.' });
         }
@@ -135,6 +153,7 @@ async function microsoftLogin(page, username, password) {
     // Đợi trang callback của Joomla xử lý xong phiên đăng nhập rồi mới đi tiếp
     await page.waitForFunction(() => document.readyState === 'complete', { timeout: 20000 }).catch(() => {});
     await page.waitForNetworkIdle({ idleTime: 800, timeout: 15000 }).catch(() => {});
+    log('Đăng nhập xong, đang ở: ' + page.url());
 }
 
 // ---------------------------------------------------------------
@@ -145,7 +164,8 @@ const hasGradeTable = () => {
 };
 
 async function openGradesPage(page) {
-    await page.goto(GRADES_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.goto(GRADES_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    log('Đã mở trang điểm, URL: ' + page.url());
 
     // Nếu bị đá về trang đăng nhập => chưa đăng nhập được
     if (/dang-nhap/i.test(page.url())) {
@@ -169,6 +189,7 @@ async function openGradesPage(page) {
         s.dispatchEvent(new Event('change', { bubbles: true }));
         return true;
     });
+    log(changed ? 'Đã chọn hiển thị tất cả, chờ tải lại' : 'Không đổi được/không cần đổi số dòng');
     if (changed) {
         await nav;
         await page.waitForFunction(hasGradeTable, { timeout: 30000 });
@@ -230,8 +251,9 @@ app.post('/api/login', (req, res) => {
     runExclusive(async () => {
         let browser = null;
         let page = null;
+        T0 = Date.now();
         try {
-            console.log('Khởi động trình duyệt...');
+            log('Khởi động trình duyệt...');
             browser = await puppeteer.launch({
                 headless: true,
                 executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
@@ -240,6 +262,9 @@ app.post('/api/login', (req, res) => {
                     '--disable-setuid-sandbox',
                     '--disable-dev-shm-usage',
                     '--disable-gpu',
+                    '--disable-extensions',
+                    '--mute-audio',
+                    '--no-first-run',
                     '--disable-blink-features=AutomationControlled',
                 ],
             });
@@ -258,16 +283,18 @@ app.post('/api/login', (req, res) => {
                 else r.continue().catch(() => {});
             });
 
-            console.log('B1: Đăng nhập bằng Microsoft...');
+            log('Trình duyệt đã sẵn sàng');
+            log('B1: Đăng nhập bằng Microsoft...');
             await goToMicrosoftLogin(page);
             await microsoftLogin(page, username, password);
 
-            console.log('B2: Mở trang xem điểm...');
+            log('B2: Mở trang xem điểm...');
             await openGradesPage(page);
 
-            console.log('B3: Lấy dữ liệu điểm...');
+            log('B3: Lấy dữ liệu điểm...');
             const result = await extractGrades(page);
             if (!result) throw new Error('Không đọc được bảng điểm.');
+            log('Xong: ' + result.rows.length + ' dòng điểm');
 
             // Giữ tương thích với diem_fetch.php: có field "html" (PHP sẽ lấy field này),
             // thêm "data" là dữ liệu đã tách sẵn thành mảng JSON.
